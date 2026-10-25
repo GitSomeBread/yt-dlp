@@ -19,15 +19,15 @@ class NiconicoChannelPlusBaseIE(InfoExtractor):
     _WEBPAGE_BASE_URL = 'https://nicochannel.jp'
 
     def _call_api(self, path, item_id, **kwargs):
-    headers = kwargs.get('headers', {})
-    headers.update({
-        'Origin': 'https://nicochannel.jp',
-        'Accept': 'application/json, text/plain, */*',
-    })
-    kwargs['headers'] = headers
+        headers = kwargs.get('headers', {})
+        headers.update({
+            'Origin': 'https://nicochannel.jp',
+            'Accept': 'application/json, text/plain, */*',
+        })
+        kwargs['headers'] = headers
 
-    return self._download_json(
-        f'https://api.nicochannel.jp/fc/{path}', video_id=item_id, **kwargs)
+        return self._download_json(
+            f'https://api.nicochannel.jp/fc/{path}', video_id=item_id, **kwargs)
 
     def _find_fanclub_site_id(self, channel_name):
         fanclub_list_json = self._call_api(
