@@ -21,9 +21,28 @@ class NiconicoChannelPlusBaseIE(InfoExtractor):
     def _call_api(self, path, item_id, **kwargs):
         headers = kwargs.get('headers', {})
         headers.update({
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,ja-JP;q=0.6,ja;q=0.5',
+            'Cache-Control': 'no-cache',
             'Origin': 'https://nicochannel.jp',
-            'Accept': 'application/json, text/plain, */*',
+            'Pragma': 'no-cache',
+            'Priority': 'u=1, i',
+            'Referer': 'https://nicochannel.jp/',
+            'Sec-Ch-Ua': '"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-site',
+            'fc_use_device': 'null',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36'
         })
+
+        fc_site_id = kwargs.pop('site_id', getattr(self, '_site_id', None))
+
+        if 'content_providers' not in path and fc_site_id:
+            headers['fc_site_id'] = str(fc_site_id)
+
         kwargs['headers'] = headers
 
         return self._download_json(
@@ -107,33 +126,73 @@ class NiconicoChannelPlusIE(NiconicoChannelPlusBaseIE):
 
     def _real_extract(self, url):
         content_code, channel_id = self._match_valid_url(url).group('code', 'channel')
-        fanclub_site_id = self._find_fanclub_site_id(channel_id)
+        fanclub_site_id = self._site_id = self._find_fanclub_site_id(channel_id)
 
+        # 1. 获取基本页面信息（标题、发布时间等）
         data_json = self._call_api(
-            f'video_pages/{content_code}', item_id=content_code, headers={'fc_use_device': 'null'},
+            f'video_pages/{content_code}', item_id=content_code,
             note='Fetching video page info', errnote='Unable to fetch video page info',
         )['data']['video_page']
 
-        live_status, session_id = self._get_live_status_and_session_id(content_code, data_json)
-
+        # 处理直播状态与未开播预告
+        video_type = data_json.get('type')
+        live_finished_at = data_json.get('live_finished_at')
+        live_started_at = data_json.get('live_started_at')
         release_timestamp_str = data_json.get('live_scheduled_start_at')
 
-        formats = []
+        if video_type == 'live':
+            if not live_started_at:
+                live_status = 'is_upcoming'
+            elif not live_finished_at:
+                live_status = 'is_live'
+            else:
+                live_status = 'was_live'
+        elif video_type == 'vod':
+            live_status = 'was_live' if live_finished_at else 'not_live'
+        else:
+            live_status = 'not_live'
 
         if live_status == 'is_upcoming':
-            if release_timestamp_str:
-                msg = f'This live event will begin at {release_timestamp_str} UTC'
-            else:
-                msg = 'This event has not started yet'
+            msg = f'This live event will begin at {release_timestamp_str} UTC' if release_timestamp_str else 'This event has not started yet'
             self.raise_no_formats(msg, expected=True, video_id=content_code)
-        else:
-            formats = self._extract_m3u8_formats(
-                # "authenticated_url" is a format string that contains "{session_id}".
-                m3u8_url=data_json['video_stream']['authenticated_url'].format(session_id=session_id),
-                video_id=content_code)
+
+        # 2. 调用新版 Domand 取流接口
+        headers = {
+            'fc_site_id': str(fanclub_site_id),
+            'fc_use_device': 'null',
+            'Origin': 'https://nicochannel.jp',
+            'Referer': 'https://nicochannel.jp/',
+        }
+        
+        # 支持通过命令行传 Token:
+        # 方式 1: --extractor-args "niconicochannelplus:token=xxx"
+        # 方式 2: --add-header "Authorization: Bearer xxx"（yt-dlp 会自动混入 headers）
+        access_token = self._configuration_arg('token', [None], casesense=True)[0]
+        if access_token:
+            token_clean = access_token.replace('Bearer', '').strip()
+            headers['Authorization'] = f'Bearer {token_clean}'
+
+        domand_access_data = self._call_api(
+            f'video_pages/{content_code}/domand_content_access',
+            item_id=content_code,
+            headers=headers,
+            note='Fetching domand access url',
+            errnote='Unable to fetch domand access url',
+        )
+
+        # 3. 提取 m3u8 链接 (Domand 返回的键通常是 content_url、playback_url 或 url)
+        m3u8_url = traverse_obj(domand_access_data, (
+            'data', ('content_url', 'url', 'm3u8_url', 'authenticated_url', 'playback_url'), {url_or_none}), get_all=False)
+
+        if not m3u8_url:
+            raise ExtractorError('Unable to extract m3u8 URL from domand_content_access', expected=False)
+
+        formats = self._extract_m3u8_formats(
+            m3u8_url, video_id=content_code, ext='mp4', entry_protocol='m3u8_native')
 
         return {
             'id': content_code,
+            'title': data_json.get('title'),
             'formats': formats,
             '_format_sort_fields': ('tbr', 'vcodec', 'acodec'),
             'channel': self._get_channel_base_info(fanclub_site_id).get('fanclub_site_name'),
@@ -190,52 +249,6 @@ class NiconicoChannelPlusIE(NiconicoChannelPlusBaseIE):
                 'timestamp': (('updated_at', 'sent_at', 'created_at'), {unified_timestamp}),
                 'author_is_uploader': ('sender_id', {lambda x: x == '-1'}),
             }, get_all=False)
-
-    def _get_live_status_and_session_id(self, content_code, data_json):
-        video_type = data_json.get('type')
-        live_finished_at = data_json.get('live_finished_at')
-
-        payload = {}
-        if video_type == 'vod':
-            if live_finished_at:
-                live_status = 'was_live'
-            else:
-                live_status = 'not_live'
-        elif video_type == 'live':
-            if not data_json.get('live_started_at'):
-                return 'is_upcoming', ''
-
-            if not live_finished_at:
-                live_status = 'is_live'
-            else:
-                live_status = 'was_live'
-                payload = {'broadcast_type': 'dvr'}
-
-                video_allow_dvr_flg = traverse_obj(data_json, ('video', 'allow_dvr_flg'))
-                video_convert_to_vod_flg = traverse_obj(data_json, ('video', 'convert_to_vod_flg'))
-
-                self.write_debug(f'allow_dvr_flg = {video_allow_dvr_flg}, convert_to_vod_flg = {video_convert_to_vod_flg}.')
-
-                if not (video_allow_dvr_flg and video_convert_to_vod_flg):
-                    raise ExtractorError(
-                        'Live was ended, there is no video for download.', video_id=content_code, expected=True)
-        else:
-            raise ExtractorError(f'Unknown type: {video_type}', video_id=content_code, expected=False)
-
-        self.write_debug(f'{content_code}: video_type={video_type}, live_status={live_status}')
-
-        session_id = self._call_api(
-            f'video_pages/{content_code}/session_ids', item_id=f'{content_code}/session',
-            data=json.dumps(payload).encode('ascii'), headers={
-                'Content-Type': 'application/json',
-                'fc_use_device': 'null',
-                'origin': 'https://nicochannel.jp',
-            },
-            note='Getting session id', errnote='Unable to get session id',
-        )['data']['session_id']
-
-        return live_status, session_id
-
 
 class NiconicoChannelPlusChannelBaseIE(NiconicoChannelPlusBaseIE):
     _PAGE_SIZE = 12
